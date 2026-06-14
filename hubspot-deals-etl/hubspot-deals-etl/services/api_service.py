@@ -1,355 +1,258 @@
-import requests
+"""
+HubSpot CRM API v3 service.
+
+Handles authentication, pagination, rate limiting, and error handling for the
+HubSpot deals endpoint.
+"""
+
+from __future__ import annotations
+
 import logging
-from typing import Dict, List, Optional, Any
-from datetime import datetime, timezone
 import time
-import json
-from loki_logger import get_logger, log_api_call
+from typing import Any, Generator
+
+import requests
+
+logger = logging.getLogger(__name__)
 
 
-class APIService:
+class HubSpotAuthenticationError(Exception):
+    """Raised when the HubSpot token is invalid or missing required scopes."""
+
+
+class HubSpotRateLimitError(Exception):
+    """Raised when rate limit is hit and retries are exhausted."""
+
+
+class HubSpotAPIError(Exception):
+    """Generic HubSpot API error."""
+
+
+class HubSpotAPIService:
     """
-    Service for interacting with Hubspot_Deals APIs
+    Service class for interacting with HubSpot CRM API v3.
+
+    Provides bearer token authentication, cursor-based pagination, rate limit
+    handling, token validation, and structured logging.
     """
-    
-    def __init__(self, base_url: str = "https://api.hubspot_deals.com", test_delay_seconds: float = 0):
-        self.base_url = base_url.rstrip('/')
-        self.test_delay_seconds = test_delay_seconds  # Add configurable delay for testing
-        self.logger = get_logger(__name__)
+
+    BASE_URL = "https://api.hubapi.com"
+    DEALS_ENDPOINT = "/crm/v3/objects/deals"
+    MAX_RETRIES = 3
+    RATE_LIMIT_REQUESTS = 150
+    RATE_LIMIT_WINDOW = 10
+    DEFAULT_PROPERTIES = [
+        "dealname",
+        "amount",
+        "dealstage",
+        "pipeline",
+        "closedate",
+        "createdate",
+        "hs_lastmodifieddate",
+        "hubspot_owner_id",
+        "description",
+        "hs_deal_stage_probability",
+        "hs_is_closed",
+        "hs_is_closed_won",
+        "hs_priority",
+    ]
+
+    def __init__(self, access_token: str, timeout: int = 30):
+        if not access_token or not access_token.strip():
+            raise HubSpotAuthenticationError("HubSpot access token cannot be empty.")
+
+        self.access_token = access_token.strip()
+        self.timeout = timeout
         self.session = requests.Session()
-        
-        # Set default headers
-        self.session.headers.update({
-            'Content-Type': 'application/json',
-            'Accept': 'application/json',
-            'User-Agent': 'Hubspot_Deals-Data-Extraction-Service/1.0'
-        })
-        
-        self.logger.debug(
-            "API service initialized",
-            extra={
-                'operation': 'api_service_init', 
-                'base_url': base_url,
-                'test_delay_seconds': test_delay_seconds
+        self.session.headers.update(
+            {
+                "Authorization": f"Bearer {self.access_token}",
+                "Content-Type": "application/json",
             }
         )
-    
-    def set_access_token(self, token: str):
-        """Set the Hubspot_Deals API access token"""
-        self.session.headers.update({
-            'Authorization': f'Bearer {token}'
-        })
-        self.logger.debug("Access token set", extra={'operation': 'token_set'})
-    
-    def get_data(self, 
-                 access_token: str,
-                 limit: int = 100, 
-                 after: Optional[str] = None,
-                 **kwargs) -> Dict[str, Any]:
-        """
-        Get data from Hubspot_Deals API with optional test delay
-        """
-        start_time = datetime.utcnow()
-        
-        try:
-            self.logger.info(
-                "Starting data retrieval",
-                extra={
-                    'operation': 'get_data',
-                    'limit': limit,
-                    'has_cursor': after is not None,
-                    'test_delay_seconds': self.test_delay_seconds
-                }
-            )
-            
-            # Add test delay to simulate slow API calls for cancel/pause testing
-            if self.test_delay_seconds > 0:
-                self.logger.info(
-                    f"Test delay: sleeping for {self.test_delay_seconds} seconds",
-                    extra={'operation': 'get_data', 'delay_type': 'test_delay'}
-                )
-                time.sleep(self.test_delay_seconds)
-            
-            # Set authentication headers
-            headers = {
-                'Authorization': f'Bearer {access_token}',
-                'Content-Type': 'application/json',
-                'Accept': 'application/json'
-            }
-            
-            # Build parameters
-            params = {
-                'limit': min(limit, 100),  # API limit
-            }
-            
-            if after:
-                params['after'] = after
-            
-            # Add additional parameters (excluding test-specific ones)
-            for key, value in kwargs.items():
-                if not key.startswith('_test_') and key not in ['scan_id']:
-                    params[key] = value
-            
-            # TODO: Replace with appropriate Hubspot_Deals API endpoint
-            url = f"{self.base_url}/v1/data"
-            
-            response = self.session.get(url, params=params, headers=headers)
-            
-            # Handle rate limiting
-            if response.status_code == 429:
-                retry_after = int(response.headers.get('Retry-After', 1))
-                self.logger.warning(
-                    "Rate limited, retrying",
-                    extra={
-                        'operation': 'get_data',
-                        'retry_after': retry_after,
-                        'status_code': 429
-                    }
-                )
-                time.sleep(retry_after)
-                response = self.session.get(url, params=params, headers=headers)
-            
-            response.raise_for_status()
-            
-            duration_ms = (datetime.utcnow() - start_time).total_seconds() * 1000
-            result = response.json()
-            
-            self.logger.info(
-                "Data retrieved successfully",
-                extra={
-                    'operation': 'get_data',
-                    'status_code': response.status_code,
-                    'duration_ms': round(duration_ms, 2),
-                    'result_count': len(result.get('results', [])),
-                    'has_more': result.get('paging', {}).get('next') is not None
-                }
-            )
-            
-            log_api_call(
-                self.logger,
-                "hubspot_deals_get_data",
-                method='GET',
-                status_code=response.status_code,
-                duration_ms=round(duration_ms, 2)
-            )
-            
-            return result
-            
-        except requests.exceptions.RequestException as e:
-            duration_ms = (datetime.utcnow() - start_time).total_seconds() * 1000
-            
-            self.logger.error(
-                "Error fetching data",
-                extra={
-                    'operation': 'get_data',
-                    'error': str(e),
-                    'duration_ms': round(duration_ms, 2),
-                    'status_code': getattr(e.response, 'status_code', None) if hasattr(e, 'response') else None
-                },
-                exc_info=True
-            )
-            
-            log_api_call(
-                self.logger,
-                "hubspot_deals_get_data",
-                method='GET',
-                status_code=getattr(e.response, 'status_code', None) if hasattr(e, 'response') else 500,
-                duration_ms=round(duration_ms, 2)
-            )
-            
-            raise
+        self._request_count = 0
+        self._window_start = time.time()
 
-    def validate_token(self, access_token: str) -> bool:
-        """
-        Validate Hubspot_Deals API access token
-        """
-        try:
-            self.logger.debug(
-                "Validating access token",
-                extra={'operation': 'validate_token'}
+        logger.info("HubSpotAPIService initialised (timeout=%ds)", timeout)
+
+    def _throttle(self) -> None:
+        """Apply a simple client-side rate limit guard."""
+        now = time.time()
+        elapsed = now - self._window_start
+        if elapsed >= self.RATE_LIMIT_WINDOW:
+            self._window_start = now
+            self._request_count = 0
+            return
+
+        if self._request_count >= self.RATE_LIMIT_REQUESTS:
+            sleep_for = self.RATE_LIMIT_WINDOW - elapsed
+            logger.warning(
+                "Client-side HubSpot throttle activated; sleeping for %.2fs",
+                sleep_for,
             )
-            
-            headers = {
-                'Authorization': f'Bearer {access_token}',
-                'Content-Type': 'application/json'
-            }
-            
-            # TODO: Replace with appropriate Hubspot_Deals validation endpoint
-            url = f"{self.base_url}/v1/me"
-            params = {'limit': 1}
-            
-            response = self.session.get(url, params=params, headers=headers)
-            is_valid = response.status_code == 200
-            
-            if is_valid:
-                self.logger.info(
-                    "Token validation successful",
-                    extra={'operation': 'validate_token'}
-                )
-            else:
-                self.logger.warning(
-                    "Token validation failed",
-                    extra={
-                        'operation': 'validate_token',
-                        'status_code': response.status_code
-                    }
-                )
-            
-            return is_valid
-            
-        except requests.exceptions.RequestException as e:
-            self.logger.error(
-                "Token validation error",
-                extra={'operation': 'validate_token', 'error': str(e)},
-                exc_info=True
-            )
-            return False
-    
-    def get_api_usage(self, auth_config: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        """
-        Get API usage information from Hubspot_Deals headers
-        """
-        try:
-            access_token = auth_config.get('accessToken')
-            headers = {
-                'Authorization': f'Bearer {access_token}',
-                'Content-Type': 'application/json'
-            }
-            
-            # TODO: Replace with appropriate Hubspot_Deals endpoint
-            url = f"{self.base_url}/v1/me"
-            params = {'limit': 1}
-            
-            response = self.session.get(url, params=params, headers=headers)
-            
-            if response.status_code == 200:
-                # TODO: Update based on Hubspot_Deals rate limit headers
-                usage_info = {
-                    'daily_limit': response.headers.get('X-RateLimit-Daily'),
-                    'daily_remaining': response.headers.get('X-RateLimit-Daily-Remaining'),
-                    'interval_limit': response.headers.get('X-RateLimit-Interval'),
-                    'interval_remaining': response.headers.get('X-RateLimit-Remaining'),
-                    'reset_timestamp': response.headers.get('X-RateLimit-Reset'),
-                    'timestamp': datetime.now(timezone.utc).isoformat()
-                }
-                
-                filtered_usage = {k: v for k, v in usage_info.items() if v is not None}
-                
-                if filtered_usage:
-                    self.logger.debug(
-                        "API usage info retrieved",
-                        extra={
-                            'operation': 'get_api_usage',
-                            'daily_remaining': filtered_usage.get('daily_remaining'),
-                            'interval_remaining': filtered_usage.get('interval_remaining')
-                        }
+            time.sleep(max(sleep_for, 0))
+            self._window_start = time.time()
+            self._request_count = 0
+
+    def _request_json(self, url: str, params: dict[str, Any]) -> dict[str, Any]:
+        """Perform a GET request with retries and backoff."""
+        backoff = 1
+        for attempt in range(1, self.MAX_RETRIES + 1):
+            self._throttle()
+            self._request_count += 1
+
+            try:
+                logger.debug("GET %s params=%s attempt=%d", url, params, attempt)
+                response = self.session.get(url, params=params, timeout=self.timeout)
+
+                if response.status_code == 200:
+                    return response.json()
+
+                if response.status_code == 429:
+                    retry_after = response.headers.get("Retry-After")
+                    sleep_for = int(retry_after) if retry_after and retry_after.isdigit() else backoff
+                    logger.warning(
+                        "Rate limit hit on attempt %d/%d; sleeping %ds",
+                        attempt,
+                        self.MAX_RETRIES,
+                        sleep_for,
                     )
-                
-                return filtered_usage if filtered_usage else None
-            
-            return None
-            
-        except requests.exceptions.RequestException as e:
-            self.logger.warning(
-                "Could not retrieve API usage",
-                extra={'operation': 'get_api_usage', 'error': str(e)}
-            )
-            return None
-    
-    def get_account_info(self, access_token: str) -> Optional[Dict[str, Any]]:
-        """
-        Get Hubspot_Deals account information
-        """
-        try:
-            headers = {
-                'Authorization': f'Bearer {access_token}',
-                'Content-Type': 'application/json'
-            }
-            
-            # TODO: Replace with appropriate Hubspot_Deals account endpoint
-            url = f"{self.base_url}/v1/account"
-            response = self.session.get(url, headers=headers)
-            
-            if response.status_code == 200:
-                account_info = response.json()
-                self.logger.debug(
-                    "Account info retrieved",
-                    extra={
-                        'operation': 'get_account_info',
-                        'account_id': account_info.get('id'),
-                        'account_name': account_info.get('name')
-                    }
-                )
-                return account_info
-            
-            return None
-            
-        except requests.exceptions.RequestException as e:
-            self.logger.debug(
-                "Account info not available",
-                extra={'operation': 'get_account_info', 'error': str(e)}
-            )
-            return None
+                    if attempt >= self.MAX_RETRIES:
+                        raise HubSpotRateLimitError(
+                            "Rate limit hit and retries exhausted."
+                        )
+                    time.sleep(sleep_for)
+                    backoff = min(backoff * 2, 60)
+                    continue
 
-    def test_connection(self, access_token: str) -> Dict[str, Any]:
-        """
-        Test connection to Hubspot_Deals API
-        """
-        self.logger.info(
-            "Testing API connection",
-            extra={'operation': 'test_connection'}
-        )
-        
-        results = {
-            'token_valid': False,
-            'api_reachable': False,
-            'data_accessible': False,
-            'account_info': None,
-            'usage_info': None,
-            'error': None
+                if response.status_code in {500, 503, 502, 504}:
+                    logger.warning(
+                        "HubSpot server error %s on attempt %d/%d; retrying in %ds",
+                        response.status_code,
+                        attempt,
+                        self.MAX_RETRIES,
+                        backoff,
+                    )
+                    if attempt >= self.MAX_RETRIES:
+                        raise HubSpotAPIError(
+                            f"HubSpot server error {response.status_code} after retries."
+                        )
+                    time.sleep(backoff)
+                    backoff = min(backoff * 2, 60)
+                    continue
+
+                if response.status_code == 401:
+                    raise HubSpotAuthenticationError(
+                        "HubSpot token is invalid or expired."
+                    )
+
+                if response.status_code == 403:
+                    raise HubSpotAuthenticationError(
+                        "HubSpot token missing required scope: crm.objects.deals.read"
+                    )
+
+                if response.status_code == 400:
+                    raise HubSpotAPIError(
+                        f"Bad request sent to HubSpot: {response.text[:500]}"
+                    )
+
+                raise HubSpotAPIError(
+                    f"Unexpected HubSpot response: {response.status_code} - {response.text[:200]}"
+                )
+
+            except requests.exceptions.Timeout as exc:
+                logger.warning(
+                    "HubSpot request timed out on attempt %d/%d",
+                    attempt,
+                    self.MAX_RETRIES,
+                )
+                if attempt >= self.MAX_RETRIES:
+                    raise HubSpotAPIError(
+                        "HubSpot API request timed out after all retries."
+                    ) from exc
+                time.sleep(backoff)
+                backoff = min(backoff * 2, 60)
+
+            except requests.exceptions.ConnectionError as exc:
+                logger.warning(
+                    "HubSpot connection error on attempt %d/%d: %s",
+                    attempt,
+                    self.MAX_RETRIES,
+                    exc,
+                )
+                if attempt >= self.MAX_RETRIES:
+                    raise HubSpotAPIError(f"Cannot connect to HubSpot API: {exc}") from exc
+                time.sleep(backoff)
+                backoff = min(backoff * 2, 60)
+
+        raise HubSpotAPIError("Unexpected retry loop exit.")
+
+    def validate_credentials(self) -> bool:
+        """Validate the access token by making a lightweight API call."""
+        logger.info("Validating HubSpot credentials")
+        url = f"{self.BASE_URL}{self.DEALS_ENDPOINT}"
+        data = self._request_json(url, {"limit": 1, "archived": "false"})
+        return bool(data)
+
+    def validate_token(self, access_token: str | None = None) -> bool:
+        """Backward-compatible wrapper around validate_credentials."""
+        if access_token and access_token.strip() and access_token.strip() != self.access_token:
+            temp_service = HubSpotAPIService(access_token=access_token.strip(), timeout=self.timeout)
+            return temp_service.validate_credentials()
+        return self.validate_credentials()
+
+    def get_deals(
+        self,
+        properties: list[str] | None = None,
+        limit: int = 100,
+        archived: bool = False,
+    ) -> Generator[dict[str, Any], None, None]:
+        """Yield all deals from HubSpot using cursor-based pagination."""
+        property_list = properties or self.DEFAULT_PROPERTIES
+        url = f"{self.BASE_URL}{self.DEALS_ENDPOINT}"
+        params: dict[str, Any] = {
+            "limit": min(limit, 100),
+            "properties": ",".join(property_list),
+            "archived": str(archived).lower(),
         }
-        
-        try:
-            # Test token validation
-            results['token_valid'] = self.validate_token(access_token)
-            results['api_reachable'] = results['token_valid']
-            
-            if results['token_valid']:
-                # Get additional info
-                results['account_info'] = self.get_account_info(access_token)
-                results['usage_info'] = self.get_api_usage({'accessToken': access_token})
-                
-                # Test basic data access
-                try:
-                    test_data = self.get_data(access_token, limit=1)
-                    results['data_accessible'] = True
-                    
-                    self.logger.info(
-                        "Connection test successful",
-                        extra={
-                            'operation': 'test_connection',
-                            'token_valid': results['token_valid'],
-                            'data_accessible': results['data_accessible']
-                        }
-                    )
-                    
-                except Exception as e:
-                    self.logger.warning(
-                        "Data access test failed",
-                        extra={'operation': 'test_connection', 'error': str(e)}
-                    )
-            else:
-                self.logger.warning(
-                    "Connection test failed - invalid token",
-                    extra={'operation': 'test_connection'}
-                )
-                
-        except Exception as e:
-            results['error'] = str(e)
-            self.logger.error(
-                "Connection test error",
-                extra={'operation': 'test_connection', 'error': str(e)},
-                exc_info=True
+
+        total_fetched = 0
+        page = 0
+        logger.info(
+            "Starting HubSpot deal extraction (properties=%d, limit=%d)",
+            len(property_list),
+            limit,
+        )
+
+        while True:
+            page += 1
+            data = self._request_json(url, params)
+            results = data.get("results", [])
+
+            if not results:
+                logger.info("No more results on page %d; extraction complete", page)
+                break
+
+            logger.info(
+                "Page %d fetched %d deals (total=%d)",
+                page,
+                len(results),
+                total_fetched + len(results),
             )
-        
-        return results
+
+            for deal in results:
+                total_fetched += 1
+                yield deal
+
+            next_cursor = data.get("paging", {}).get("next", {}).get("after")
+            if not next_cursor:
+                logger.info("Pagination complete. Total deals extracted: %d", total_fetched)
+                break
+
+            params["after"] = next_cursor
+
+        logger.info("HubSpot extraction finished. Total records: %d", total_fetched)
+
+
+# Backward-compatible alias for older imports.
+APIService = HubSpotAPIService
