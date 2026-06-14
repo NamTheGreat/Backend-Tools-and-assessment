@@ -15,6 +15,7 @@ from utils import (
 )
 from .database_service import DatabaseService
 from .data_source import create_data_source
+from services.data_source import HubSpotDealsDataSource
 
 from .job_service import JobService
 from loki_logger import get_logger, log_business_event, log_security_event
