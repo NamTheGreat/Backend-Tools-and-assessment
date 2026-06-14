@@ -1,13 +1,13 @@
 {
-  "project_name": "hubspot_user",
-  "service_name": "hubspot_user",
-  "template_path": "./template", 
-  "destination_dir": "./hubspot_user",
+  "project_name": "hubspot-deals-etl",
+  "service_name": "hubspot_deals",
+  "template_path": "./template",
+  "destination_dir": "./hubspot-deals-etl",
   "ports": {
-    "dev": 4117,
-    "stage": 5117,
-    "prod": 3117
+    "dev": 5200,
+    "stage": 5201,
+    "prod": 5202
   },
   "force_overwrite": false,
-  "verbose": false
+  "verbose": true
 }
